@@ -52,7 +52,6 @@ class CLS_MODEL(nn.Module):
         return x
 
 
-
 if __name__ == '__main__':
     net = CLS_MODEL('vgg16', 4, False)
     x = torch.randn(8,3,224,224)

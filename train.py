@@ -5,48 +5,40 @@ import cv2
 import torch.nn.functional as F
 from tqdm import tqdm
 from sklearn.metrics import f1_score, accuracy_score, precision_score, recall_score, confusion_matrix, roc_curve, auc
-from pathlib import Path
+import shutil
 import json
 from torch.utils.tensorboard import SummaryWriter
 import torch
 import os
-from cfg import device, pos_dict, opt, num_classes
+from cfg import device, opt, num_classes, train_dataset, val_dataset, label_weights, milestones
 from model import CLS_MODEL
 
+class MultiClassFocalLossWithAlpha(torch.nn.Module):
+    def __init__(self, alpha=[0.2, 0.3, 0.5], gamma=2, reduction='mean'):
+        """
+        :param alpha: 权重系数列表，三分类中第0类权重0.2，第1类权重0.3，第2类权重0.5
+        :param gamma: 困难样本挖掘的gamma
+        :param reduction:
+        """
+        super(MultiClassFocalLossWithAlpha, self).__init__()
+        self.alpha = torch.tensor(alpha).to(device)
+        self.gamma = gamma
+        self.reduction = reduction
 
-def preprocess(img, img_size):
-    h, w, _ = img.shape
-    crop_size = h if h < w else w
-    img = img[:crop_size, :crop_size, :]
-    img = cv2.resize(img, (img_size, img_size))
-    minVal, maxVal = np.min(img), np.max(img)
-    img = (img - minVal) / (maxVal - minVal)
-    return img.astype('float32')
-
-class dataset(Dataset):
-    def __init__(self, data_root, img_size):
-        self.img_paths = [i for i in Path(data_root).rglob('*.jpg')]
-        self.img_size = img_size
-
-    def __len__(self):
-        return len(self.img_paths)
-
-    def __getitem__(self, idx):
-        img_name = self.img_paths[idx].parent.name
-        if img_name in pos_dict:
-            class_id = pos_dict[img_name]
-            label = torch.tensor(class_id, dtype=torch.long)
-        else:
-            label = torch.tensor(0, dtype=torch.long)
-
-        img_path = str(self.img_paths[idx])
-        img = cv2.imread(img_path)
-        img = preprocess(img, self.img_size)
-
-        img = torch.from_numpy(img).permute(2, 0, 1)
-
-        return img, label
-
+    def forward(self, pred, target):
+        alpha = self.alpha[target]  # 为当前batch内的样本，逐个分配类别权重，shape=(bs), 一维向量
+        log_softmax = torch.log_softmax(pred, dim=1) # 对模型裸输出做softmax再取log, shape=(bs, 3)
+        logpt = torch.gather(log_softmax, dim=1, index=target.view(-1, 1))  # 取出每个样本在类别标签位置的log_softmax值, shape=(bs, 1)
+        logpt = logpt.view(-1)  # 降维，shape=(bs)
+        ce_loss = -logpt  # 对log_softmax再取负，就是交叉熵了
+        pt = torch.exp(logpt)  #对log_softmax取exp，把log消了，就是每个样本在类别标签位置的softmax值了，shape=(bs)
+        focal_loss = alpha * (1 - pt) ** self.gamma * ce_loss  # 根据公式计算focal loss，得到每个样本的loss值，shape=(bs)
+        if self.reduction == "mean":
+            return torch.mean(focal_loss)
+        if self.reduction == "sum":
+            return torch.sum(focal_loss)
+        return focal_loss
+    
 
 def train(opt):
     if not os.path.exists(opt.save_dir):
@@ -58,17 +50,19 @@ def train(opt):
     with open(opt.save_dir + '/train_opts.json', 'w') as f:
         json.dump(opt_dict, f, indent=2)
 
-    writer = SummaryWriter(opt.save_dir)
+    log_dir = opt.save_dir + '/log'
+    if os.path.exists(log_dir):
+        shutil.rmtree(log_dir)
+    writer = SummaryWriter(log_dir)
 
     net = CLS_MODEL(opt.backbone, num_classes, opt.pretrained).to(device)
+    # print(net)
 
-    print(net)
-
-    criterion = torch.nn.CrossEntropyLoss()
+    # criterion = torch.nn.CrossEntropyLoss()
+    criterion = MultiClassFocalLossWithAlpha(alpha=label_weights, gamma=2, reduction='mean')
 
     optimizer = torch.optim.Adam(net.parameters(), lr=opt.lr)
 
-    milestones = [i * opt.end_epoch // 10 for i in range(7, 10)]
     lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=milestones)
 
     if os.path.exists(opt.resume_path):
@@ -81,30 +75,31 @@ def train(opt):
     else:
         start_epoch = 0
 
-    train_dataset = dataset(opt.data_root + '/train', opt.img_size)
     train_dataloader = DataLoader(train_dataset, batch_size=opt.batch_size, shuffle=True, num_workers=4)
 
-    val_dataset = dataset(opt.data_root + '/val', opt.img_size)
     val_dataloader = DataLoader(val_dataset, batch_size=opt.batch_size, shuffle=False, num_workers=4)
 
-    iter_n = len(train_dataloader)
+    iter_n_per_epoch = len(train_dataloader)
     max_val_f1 = -1000
     min_val_loss = 1000
     for epoch in range(start_epoch + 1, opt.end_epoch + 1):
         # train
         net.train()
+        avg_loss = []
         for i, batchData in enumerate(train_dataloader):
             img = batchData[0].to(device)
             label = batchData[1].to(device)
             optimizer.zero_grad()
             pred = net(img)
             loss = criterion(pred, label)
+            avg_loss.append(loss.item())
             loss.backward()
             optimizer.step()
-            if i % int(iter_n * 0.1) == 0:
-                print('Epoch:{}, Iter:[{}/{}], loss:{}'.format(epoch, i + 1, iter_n, loss.item()))
-            writer.add_scalar('train_loss', loss.item(), global_step=epoch)
-            writer.add_scalar('lr', optimizer.state_dict()['param_groups'][0]['lr'], global_step=epoch)
+            # if i % int(iter_n_per_epoch * 0.1) == 0:
+            print('Epoch:{}, Iter:[{}/{}], loss:{}'.format(epoch, i + 1, iter_n_per_epoch, loss.item()))
+        avg_loss = sum(avg_loss) / len(avg_loss)
+        writer.add_scalar('train_loss', avg_loss, global_step=epoch)
+        writer.add_scalar('lr', optimizer.state_dict()['param_groups'][0]['lr'], global_step=epoch)
 
         # val
         net.eval()
@@ -115,10 +110,10 @@ def train(opt):
                 img = batchData[0].to(device)
                 label = batchData[1].to(device)
                 pred = net(img)
-            loss = criterion(pred_label, label)
+            loss = criterion(pred, label)
             avg_loss.append(loss.item())
             label = label.cpu().tolist()
-            softmax = F.softmax(pred_label.cpu(), dim=1)
+            softmax = F.softmax(pred.cpu(), dim=1)
             pred_label = torch.max(softmax, 1)[1].cpu().tolist()
             # print(label, pred_label)
             labels.extend(label)

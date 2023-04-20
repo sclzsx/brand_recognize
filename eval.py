@@ -7,24 +7,31 @@ from tqdm import tqdm
 from sklearn.metrics import f1_score, accuracy_score, precision_score, recall_score, confusion_matrix, roc_curve, auc
 from pathlib import Path
 import json
-from cfg import device, pos_dict, model, opt, num_classes
+from cfg import device, opt, num_classes, test_dataset, mean, std, label_dict
 import torch
 from model import CLS_MODEL
-from train import dataset
+import os
+
+def find_label_name(label, label_dict):
+    neg_name = 'fake_or_unknown'
+    for label_name, label_val in label_dict.items():
+        if label == label_val:
+            return label_name
+    return neg_name
 
 def evaluate(opt, test_pt_name):
-    net = CLS_MODEL(opt.backbone, num_classes, opt.pretrained).to(device)
+    net = CLS_MODEL(opt.backbone, num_classes, False).to(device)
 
     checkpoint = torch.load(opt.save_dir + '/' + test_pt_name + '.pt')
     net.load_state_dict(checkpoint['net'])
-
-    test_dataset = dataset(opt.data_root + '/test', opt.img_size)
-
     net.eval()
 
+    save_img_dir = opt.save_dir + '/testset_out'
+    if not os.path.exists(save_img_dir):
+        os.makedirs(save_img_dir)
+
     labels, preds, pred_scores = [], [], []
-    cnt = 0
-    for Data in tqdm(test_dataset):
+    for i, Data in enumerate(test_dataset):
         img = Data[0].unsqueeze(0).to(device)
         label = Data[1].item()
         with torch.no_grad():
@@ -37,7 +44,24 @@ def evaluate(opt, test_pt_name):
         pred_scores.append(score)
         # print(label, pred_label, score)
 
-        # img = (np.array(img.cpu().squeeze().permute(1, 2, 0)) * 255).astype('uint8')
+        img = np.array(img.cpu().squeeze().permute(1, 2, 0))
+        img = img * std + mean
+        img = np.clip(img * 255, 0, 255).astype('uint8').copy()
+
+        pred_name = find_label_name(pred_label, label_dict)
+        label_name = find_label_name(label, label_dict)
+
+        status = 'correct' if pred_label == label else 'wrong'
+
+        info_text = 'label: %s, pred: %s, score: %.3f, status: %s' % (label_name, pred_name, score, status)
+        print(info_text)
+
+        if i % int(len(test_dataset) * 0.1) == 0:
+            cv2.putText(img, 'label: %s' % label_name, (0, 15), cv2.FONT_HERSHEY_COMPLEX, 0.5, (0, 0, 255), 1)
+            cv2.putText(img, 'pred : %s' % pred_name, (0, 30), cv2.FONT_HERSHEY_COMPLEX, 0.5, (0, 0, 255), 1)
+            cv2.putText(img, 'score: %.3f' % score, (0, 45), cv2.FONT_HERSHEY_COMPLEX, 0.5, (0, 0, 255), 1)
+            cv2.putText(img, 'status: %s' % status, (0, 60), cv2.FONT_HERSHEY_COMPLEX, 0.5, (0, 0, 255), 1)
+            cv2.imwrite(save_img_dir + '/' + str(i) + '_' + status + '.jpg', img)
 
     if num_classes > 2:
         precision = precision_score(labels, preds, average='weighted')

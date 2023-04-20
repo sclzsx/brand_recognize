@@ -1,17 +1,21 @@
-STEPS
+# Brand recognization
 
-1. Prepare videos named as '*_regular.mp4' or '*_fake.mp4', where '*' indicates the brand name.
+## STEPS
 
-2. Generate dataset.
-    python prepare.py
+### 1. Prepare videos.
+Place videos named as '*_regular.mp4' or '*_fake.mp4' in a folder, where '*' indicates the brand name.
 
-3. Modify configurations in cfg.py
+### 2. Generate dataset.
+python prepare.py
 
-4. Perform training.
-    python train.py
+### 3. Modify configurations.
+Check cfg.py
 
-5. Perform evalution.
-    python eval.py
+### 4. Perform training.
+python train.py
 
-6. Run demo (make sure the camera is available first).
-    python demo.py
+### 5. Perform evalution.
+python eval.py
+
+### 6. Run demo (make sure the camera is available first).
+python demo.py
